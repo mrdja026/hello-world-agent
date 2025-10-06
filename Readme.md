@@ -1,4 +1,8 @@
-## What this repo does
+# Airweave local Postgres RAG fast lookup
+
+### Uses Airweave that is gitignored
+ - Clone the Airweave from (github)(https://github.com/airweave-ai/airweave)
+ - Follow instructions to install
 
 Small local search experiment:
 
@@ -47,3 +51,8 @@ Vector similarity is fast but can surface semantically close yet not-the-best re
 - Aligns results with task-specific relevance beyond pure cosine distance.
 
 Keep k small (e.g., 50→5) to stay cheap and snappy.
+
+### TODO
+- [ ] The structured vs unstructured data is a pain
+- [ ] Structured data (json, rows) should have some semantic meaning in them, so combining the data with like Fuel Vendor with {Name} that is a company type {CompanyType} ect can be better with reranking or even plain cosine similarity
+- [ ] Test thhat
