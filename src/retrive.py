@@ -12,7 +12,8 @@ conn = psycopg2.connect(
 cur = conn.cursor()
 
 # Example: get vendors
-cur.execute("SELECT id, name, email, description FROM vendors LIMIT 5;")
+cur.execute("SELECT id, name, email, description FROM vendors LIMIT 5;") # can we adjust this to be a function that returns arrow of semantinc normal data?
+
 rows = cur.fetchall()
 
 for row in rows:
