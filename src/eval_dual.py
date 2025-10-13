@@ -1,11 +1,15 @@
 import sys
 import os
 from typing import List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Reuse the dual-search helpers and config
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if THIS_DIR not in sys.path:
+    sys.path.insert(0, THIS_DIR)
+
 try:
-    from src.search_dual import (
+    from search_dual import (
         embed,
         qdrant_search,
         fuse_by_vendor_id,
@@ -13,7 +17,7 @@ try:
         COLLECTION_ENRICHED,
     )
 except Exception as e:
-    print(f"Failed to import dual search helpers: {e}")
+    print(f"Failed to import dual search helpers: {e}. Try running: python -m src.eval_dual (from project root) or python src/eval_dual.py")
     sys.exit(1)
 
 
@@ -37,7 +41,7 @@ def print_hits(collection: str, hits: List[Dict[str, Any]], max_rows: int):
 
 
 def evaluate_queries(queries: List[str], k_print: int = 5, k_search_each: int = 10):
-    ts = datetime.utcnow().isoformat()
+    ts = datetime.now(datetime.UTC).isoformat()
     print_section(f"Dual evaluation run @ {ts} (k_print={k_print}, search_each={k_search_each})")
 
     for q in queries:
@@ -50,6 +54,11 @@ def evaluate_queries(queries: List[str], k_print: int = 5, k_search_each: int = 
 
         raw_hits = qdrant_search(COLLECTION_RAW, q_vec, k_search_each)
         enr_hits = qdrant_search(COLLECTION_ENRICHED, q_vec, k_search_each)
+
+        if not raw_hits:
+            print("[hint] No raw hits. If collection is missing, run: python -m src.ingest_pogress")
+        if not enr_hits:
+            print("[hint] No enriched hits. If collection is missing, run: python -m src.ingest_enriched")
 
         print_section(f"RAW top-{k_print} ({COLLECTION_RAW})")
         print_hits(COLLECTION_RAW, raw_hits, k_print)

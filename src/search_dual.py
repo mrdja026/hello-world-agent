@@ -22,13 +22,31 @@ def embed(text: str) -> List[float]:
 
 
 # ---- QDRANT SEARCH ----
+def collection_exists(name: str) -> bool:
+    try:
+        r = requests.get(f"{QDRANT_URL}/collections/{name}")
+        if r.status_code != 200:
+            return False
+        # Qdrant returns a JSON body; if it parses and 200, the collection exists
+        return True
+    except Exception:
+        return False
+
 def qdrant_search(collection: str, vector: List[float], limit: int) -> List[Dict[str, Any]]:
+    # Preflight: if collection is missing, return [] with a hint instead of raising
+    if not collection_exists(collection):
+        print(f"[warn] Qdrant collection '{collection}' is missing. Run the ingesters to create it.")
+        return []
+
     payload = {
         "vector": vector,
         "limit": limit,
         "with_payload": True
     }
     resp = requests.post(f"{QDRANT_URL}/collections/{collection}/points/search", json=payload)
+    if resp.status_code == 404:
+        print(f"[warn] Qdrant collection '{collection}' not found (404). Run the ingesters to create it.")
+        return []
     resp.raise_for_status()
     data = resp.json()
     return data.get("result", [])

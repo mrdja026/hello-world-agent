@@ -3,7 +3,11 @@ import requests
 import json
 import os
 import hashlib
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from decimal import Decimal
+from datetime import datetime
+from sentence_transformers import SentenceTransformer
+from local_vector_store import save_points_jsonl
 
 # ---- CONFIG ----
 PG_CONN = dict(
@@ -18,30 +22,26 @@ QDRANT_URL = "http://localhost:6333"
 OLLAMA_URL = "http://localhost:11434"
 MODEL = "bge-base-en-v1.5"
 
-COLLECTION = "fuel-me-enriched"
+# Single test collection for ENRICHED pass
+COLLECTION = "fuel-me"
 CACHE_DIR = ".cache"
 HASH_FILE = os.path.join(CACHE_DIR, "enriched_hashes.json")
+# Local vector store JSONL (single collection for testing)
+LOCAL_STORE_FILE = os.path.join(CACHE_DIR, "fuel-me.jsonl")
 
 # ---- HELPERS ----
+# Use local SentenceTransformer for embeddings during testing (bypasses Ollama)
+_EMBEDDER = SentenceTransformer("BAAI/bge-base-en-v1.5")
 def embed(text: str):
-    res = requests.post(f"{OLLAMA_URL}/api/embeddings", json={"model": MODEL, "input": text})
-    res.raise_for_status()
-    return res.json()["embedding"]
+    return _EMBEDDER.encode(text).tolist()
 
 def qdrant_create_collection(size: int):
-    payload = {"vectors": {"size": size, "distance": "Cosine"}}
-    r = requests.put(f"{QDRANT_URL}/collections/{COLLECTION}", json=payload)
-    try:
-        print("[qdrant] ensure collection:", r.json())
-    except Exception:
-        print("[qdrant] ensure collection status:", r.status_code)
+    # Disabled for local testing (using JSONL store)
+    print("[local-store] Skipping Qdrant collection creation for testing.")
 
 def qdrant_upsert(points):
-    r = requests.put(f"{QDRANT_URL}/collections/{COLLECTION}/points?wait=true", json={"points": points})
-    try:
-        print("[qdrant] upsert:", r.json())
-    except Exception:
-        print("[qdrant] upsert status:", r.status_code)
+    # Disabled for local testing (using JSONL store)
+    print("[local-store] Skipping Qdrant upsert for testing.")
 
 def load_hashes() -> Dict[str, str]:
     if not os.path.exists(HASH_FILE):
@@ -56,6 +56,43 @@ def save_hashes(h: Dict[str, str]) -> None:
     os.makedirs(CACHE_DIR, exist_ok=True)
     with open(HASH_FILE, "w", encoding="utf-8") as f:
         json.dump(h, f, ensure_ascii=False, indent=2)
+
+def to_int(val: Any) -> Optional[int]:
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except Exception:
+        try:
+            return int(float(val))
+        except Exception:
+            return None
+
+def to_float(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+def to_json_safe(obj: Any) -> Any:
+    """Recursively convert Decimals, datetimes, and other non-JSON types to JSON-safe."""
+    if isinstance(obj, Decimal):
+        try:
+            return float(obj)
+        except Exception:
+            return None
+    if isinstance(obj, (str, int, float)) or obj is None:
+        return obj
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_json_safe(v) for v in obj]
+    # Fallback: string representation
+    return str(obj)
 
 def make_profile_text(row: Dict[str, Any]) -> str:
     name = row.get("vendor_name") or ""
@@ -119,11 +156,11 @@ def main():
                 "vendor_name": r.get("vendor_name"),
                 "vendor_email": r.get("vendor_email"),
                 "vendor_status": r.get("vendor_status"),
-                "total_orders": r.get("total_orders"),
-                "completed_orders": r.get("completed_orders"),
-                "pending_orders": r.get("pending_orders"),
-                "cancelled_orders": r.get("cancelled_orders"),
-                "avg_amount": r.get("avg_amount"),
+                "total_orders": to_int(r.get("total_orders")),
+                "completed_orders": to_int(r.get("completed_orders")),
+                "pending_orders": to_int(r.get("pending_orders")),
+                "cancelled_orders": to_int(r.get("cancelled_orders")),
+                "avg_amount": to_float(r.get("avg_amount")),
                 "last_order": str(r.get("last_order")) if r.get("last_order") else None,
                 "profile_summary": r.get("profile_summary"),
                 "profile_text": text,
@@ -134,13 +171,12 @@ def main():
         cache[str(vid)] = h
 
     if to_upsert:
-        dim = len(to_upsert[0]["vector"])
-        qdrant_create_collection(dim)
-        qdrant_upsert(to_upsert)
+        # Write to local JSONL vector store for testing (bypass Qdrant)
+        save_points_jsonl(LOCAL_STORE_FILE, to_upsert)
         save_hashes(cache)
-        print(f"[done] Upserted {len(to_upsert)} enriched vendor profiles")
+        print(f"[done] Wrote {len(to_upsert)} enriched vendor profiles to local store {LOCAL_STORE_FILE}")
     else:
-        print("[done] No changes detected; nothing to upsert")
+        print("[done] No changes detected; nothing to write")
 
     cur.close()
     conn.close()

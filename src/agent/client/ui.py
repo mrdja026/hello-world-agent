@@ -1,8 +1,16 @@
 import streamlit as st
 import psycopg2
 from sentence_transformers import SentenceTransformer, CrossEncoder
-from qdrant_client import QdrantClient
 import torch
+import sys, os
+
+# Ensure we can import modules from the project src/ directory when running via Streamlit
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+SRC_DIR = os.path.join(BASE_DIR, "src")
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+from local_vector_store import load_points_jsonl, cosine_search
 
 # ---- CONFIG ----
 PG_CONN = dict(
@@ -10,37 +18,37 @@ PG_CONN = dict(
     user="postgres",
     password="smederevo026",
     host="localhost",
-    port=54321,
+    port="54321",
 )
 
-QDRANT_URL = "http://localhost:6333"
-COLLECTION = "fuel-me-all"
+# Local JSONL vector store (single test collection)
+LOCAL_STORE_FILE = "src/.cache/fuel-me.jsonl"
 
 # ---- MODELS ----
 device = "cuda" if torch.cuda.is_available() else "cpu"
 embedder = SentenceTransformer("BAAI/bge-base-en-v1.5", device=device)
 reranker = CrossEncoder("BAAI/bge-reranker-base", device=device)
 
-# ---- DB + Qdrant ----
-conn = psycopg2.connect(**PG_CONN)
-qdrant = QdrantClient(url=QDRANT_URL)
+# ---- DB (optional, not used in retrieval path for local testing) ----
+conn = psycopg2.connect(**PG_CONN)  # type: ignore[arg-type]
 
 # ---- UI ----
 st.set_page_config(page_title="Fuel-Me Agent", page_icon="⛽")
 st.title("🧑‍💻 Fuel-Me Agent (DB-wide Semantic Search)")
 
 st.markdown("""
-Ask natural language questions across **users, roles, orders, vendors**.  
-Pipeline: **Embedding → Qdrant Retrieval → CrossEncoder Rerank → Postgres Details**.
+Ask natural language questions across **users, roles, orders, vendors**.
+Pipeline: **Embedding → Local Cosine Retrieval (JSONL) → (optional) CrossEncoder Rerank → Details**.
 """)
 
 # Sidebar controls
 st.sidebar.header("⚙️ Settings")
 min_score = st.sidebar.slider(
-    "Minimum rerank score",
+    "Minimum score threshold",
     min_value=0.0, max_value=1.0, value=0.40, step=0.05,
-    help="Filter out weak semantic matches (CrossEncoder scores)."
+    help="When reranker is ON, threshold applies to CrossEncoder scores. When OFF, threshold applies to Qdrant cosine scores."
 )
+use_reranker = st.sidebar.checkbox("Use reranker (CrossEncoder)", value=True)
 
 # Example queries
 with st.expander("💡 Example questions"):
@@ -67,43 +75,73 @@ if st.button("Search"):
         # Step 1: Embed query
         qvec = embedder.encode(query).tolist()
 
-        # Step 2: Retrieve candidates from Qdrant
-        hits = qdrant.search(collection_name=COLLECTION, query_vector=qvec, limit=30)
+        # Step 2: Load local store and retrieve via cosine
+        points = load_points_jsonl(LOCAL_STORE_FILE)
+        # Fetch more than UI needs so reranker (if on) has headroom
+        hits = cosine_search(points, qvec, limit=60)
 
-        if not hits:
-            st.warning("No results found in Qdrant.")
-        else:
-            # Step 3: Build candidate texts
-            candidates = []
-            for h in hits:
-                payload = h.payload
-                table = payload["table"]
-                data = payload["data"]
+        # Build unified candidate texts derived from payloads
+        candidates = []
+        for h in hits:
+            payload = h.get("payload") or {}
+            # Prefer enriched-style text if available
+            text = payload.get("profile_text") or payload.get("profile_summary") or ""
+            if not text:
+                # Fallback to raw-style text
+                data = payload.get("data", {}) or {}
+                table = payload.get("table", "vendors")
+                # compact text from key: value fields
+                raw_text = " | ".join(f"{k}: {v}" for k, v in data.items() if v is not None)
+                text = f"[{table}] {raw_text}" if raw_text else "[vendors]"
+            candidates.append((text, payload, float(h.get("score", 0.0))))
 
-                # readable string
-                text = " | ".join(f"{k}: {v}" for k, v in data.items() if v is not None)
-                candidates.append((f"[{table}] {text}", payload))
-
-            # Step 4: Rerank with cross-encoder
-            pairs = [(query, text) for text, _ in candidates]
-            scores = reranker.predict(pairs)
-
+        # Step 3: Scoring — either rerank with CrossEncoder or use cosine scores directly
+        if use_reranker:
+            pairs = [(query, t) for t, _, _ in candidates]
+            scores = reranker.predict(pairs) if pairs else []
             rescored = sorted(
-                [(text, payload, float(s)) for (text, payload), s in zip(candidates, scores)],
+                [(t, p, float(s)) for (t, p, _), s in zip(candidates, scores)],
                 key=lambda x: x[2], reverse=True
             )
+        else:
+            # Cosine-only: trust local cosine scores
+            rescored = sorted(candidates, key=lambda x: x[2], reverse=True)
 
-            # Step 5: Apply threshold
-            filtered = [r for r in rescored if r[2] >= min_score]
+        # Step 4: Apply threshold (CrossEncoder score if ON, else cosine score)
+        filtered = [r for r in rescored if r[2] >= min_score]
 
-            if not filtered:
-                st.warning(f"No results above threshold {min_score:.2f}. Try lowering it.")
-            else:
-                for text, payload, score in filtered[:10]:
-                    st.markdown("---")
-                    st.subheader(f"📊 Table: {payload['table']} — 🔥 Score {score:.3f}")
+        # Step 5: Render a single column (local store fuel-me)
+        st.markdown("### 🔎 Results (fuel-me, local)")
+        if not filtered:
+            st.info("No results above threshold.")
+        else:
+            for text, payload, score in filtered[:10]:
+                st.markdown("---")
+                # Prefer enriched presentation if fields exist; fallback to raw-style
+                name = payload.get('vendor_name') or ''
+                status = payload.get('vendor_status') or ''
+                if name or status:
+                    # Enriched-like display
+                    st.subheader(f"👤 {name} — 🔥 Score {score:.3f}")
+                    st.caption(f"Profile text: {text}")
+                    st.json({
+                        "vendor_id": payload.get("vendor_id"),
+                        "vendor_email": payload.get("vendor_email"),
+                        "vendor_status": status,
+                        "total_orders": payload.get("total_orders"),
+                        "completed_orders": payload.get("completed_orders"),
+                        "pending_orders": payload.get("pending_orders"),
+                        "cancelled_orders": payload.get("cancelled_orders"),
+                        "avg_amount": payload.get("avg_amount"),
+                        "last_order": payload.get("last_order"),
+                        "profile_summary": payload.get("profile_summary"),
+                    })
+                else:
+                    # Raw-like display
+                    table = payload.get('table', 'vendors')
+                    st.subheader(f"📊 Table: {table} — 🔥 Score {score:.3f}")
                     st.caption(f"Semantic text: {text}")
-                    st.json(payload["data"])
+                    st.json(payload.get("data", {}))
 
     except Exception as e:
         st.error(f"Error: {e}")

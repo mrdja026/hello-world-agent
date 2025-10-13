@@ -1,9 +1,14 @@
 import psycopg2
 import requests
+from sentence_transformers import SentenceTransformer
+# Using HTTP (requests) for Qdrant operations with schema fallbacks
 import json
 import os
 import hashlib
 from typing import Dict, Any, List
+from decimal import Decimal
+from datetime import datetime
+from local_vector_store import save_points_jsonl
 
 # ---- CONFIG ----
 PG_CONN = dict(
@@ -18,46 +23,31 @@ QDRANT_URL = "http://localhost:6333"
 OLLAMA_URL = "http://localhost:11434"
 MODEL = "bge-base-en-v1.5"   # embedding model via Ollama
 
-# Raw collection (cosine only)
-COLLECTION = "fuel-me-raw"
+# Single test collection (cosine only) for RAW pass
+COLLECTION = "fuel-me"
 
 # Basic change-detection cache (skip re-embedding unchanged rows)
 CACHE_DIR = ".cache"
 RAW_HASH_FILE = os.path.join(CACHE_DIR, "raw_hashes.json")
 
+# Local vector store JSONL (single collection for testing)
+LOCAL_STORE_FILE = os.path.join(CACHE_DIR, "fuel-me.jsonl")
+
 
 # ---- HELPERS ----
+# Use local SentenceTransformer for embeddings during testing (bypasses Ollama)
+_EMBEDDER = SentenceTransformer("BAAI/bge-base-en-v1.5")
 def embed(text: str) -> List[float]:
-    res = requests.post(f"{OLLAMA_URL}/api/embeddings",
-                        json={"model": MODEL, "input": text})
-    res.raise_for_status()
-    data = res.json()
-    # Ollama embeddings API returns {"embedding": [...]}
-    return data["embedding"]
+    return _EMBEDDER.encode(text).tolist()
 
 
+# Qdrant disabled for local testing
 def qdrant_create_collection(size: int):
-    payload = {
-        "vectors": {
-            "size": size,
-            "distance": "Cosine"
-        }
-    }
-    r = requests.put(f"{QDRANT_URL}/collections/{COLLECTION}",
-                     json=payload)
-    try:
-        print("[qdrant] ensure collection:", r.json())
-    except Exception:
-        print("[qdrant] ensure collection status:", r.status_code)
+    print("[local-store] Skipping Qdrant collection creation for testing.")
 
 
 def qdrant_upsert(points):
-    r = requests.put(f"{QDRANT_URL}/collections/{COLLECTION}/points?wait=true",
-                     json={"points": points})
-    try:
-        print("[qdrant] upsert:", r.json())
-    except Exception:
-        print("[qdrant] upsert status:", r.status_code)
+    print("[local-store] Skipping Qdrant upsert for testing.")
 
 
 def load_hashes(path: str) -> Dict[str, str]:
@@ -74,6 +64,24 @@ def save_hashes(path: str, h: Dict[str, str]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(h, f, ensure_ascii=False, indent=2)
+
+def to_json_safe(obj: Any) -> Any:
+    """Recursively convert non-JSON-safe types (Decimal, datetime, etc.) to JSON-safe."""
+    if isinstance(obj, Decimal):
+        try:
+            return float(obj)
+        except Exception:
+            return None
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, (str, int, float)) or obj is None:
+        return obj
+    if isinstance(obj, dict):
+        return {k: to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_json_safe(v) for v in obj]
+    # Fallback to string
+    return str(obj)
 
 
 def sha256(s: str) -> str:
@@ -126,13 +134,12 @@ def main():
         cache[cache_key] = h
 
     if all_points:
-        dim = len(all_points[0]["vector"])
-        qdrant_create_collection(dim)
-        qdrant_upsert(all_points)
+        # Write to local JSONL vector store for testing (bypass Qdrant)
+        save_points_jsonl(LOCAL_STORE_FILE, all_points)
         save_hashes(RAW_HASH_FILE, cache)
-        print(f"[done] Upserted {len(all_points)} raw vendor rows into {COLLECTION}")
+        print(f"[done] Wrote {len(all_points)} raw vendor rows to local store {LOCAL_STORE_FILE}")
     else:
-        print("[done] No changes detected; nothing to upsert")
+        print("[done] No changes detected; nothing to write")
 
     cur.close()
     conn.close()
