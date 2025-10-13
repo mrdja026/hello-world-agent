@@ -1,6 +1,6 @@
 import streamlit as st
 import psycopg2
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import SentenceTransformer
 import torch
 import sys, os
 
@@ -22,12 +22,12 @@ PG_CONN = dict(
 )
 
 # Local JSONL vector store (single test collection)
-LOCAL_STORE_FILE = "src/.cache/fuel-me.jsonl"
+# Use absolute path so Streamlit CWD does not matter
+LOCAL_STORE_FILE = os.path.join(BASE_DIR, "src", ".cache", "fuel-me.jsonl")
 
 # ---- MODELS ----
 device = "cuda" if torch.cuda.is_available() else "cpu"
 embedder = SentenceTransformer("BAAI/bge-base-en-v1.5", device=device)
-reranker = CrossEncoder("BAAI/bge-reranker-base", device=device)
 
 # ---- DB (optional, not used in retrieval path for local testing) ----
 conn = psycopg2.connect(**PG_CONN)  # type: ignore[arg-type]
@@ -46,9 +46,9 @@ st.sidebar.header("⚙️ Settings")
 min_score = st.sidebar.slider(
     "Minimum score threshold",
     min_value=0.0, max_value=1.0, value=0.40, step=0.05,
-    help="When reranker is ON, threshold applies to CrossEncoder scores. When OFF, threshold applies to Qdrant cosine scores."
+    help="When reranker is ON, threshold applies to CrossEncoder scores. When OFF, threshold applies to local cosine scores."
 )
-use_reranker = st.sidebar.checkbox("Use reranker (CrossEncoder)", value=True)
+debug_mode = st.sidebar.checkbox("Debug: show raw cosine top-10 (ignore threshold)", value=False)
 
 # Example queries
 with st.expander("💡 Example questions"):
@@ -75,10 +75,36 @@ if st.button("Search"):
         # Step 1: Embed query
         qvec = embedder.encode(query).tolist()
 
+        # Preflight diagnostics for local store path
+        cwd = os.getcwd()
+        abs_path = LOCAL_STORE_FILE  # already absolute via BASE_DIR
+        exists = os.path.exists(abs_path)
+        size_bytes = os.path.getsize(abs_path) if exists else 0
+        line_count = 0
+        if exists:
+            try:
+                with open(abs_path, "r", encoding="utf-8") as _f:
+                    for _ in _f:
+                        line_count += 1
+            except Exception:
+                pass
+        st.caption(f"CWD: {cwd}")
+        st.caption(f"Local store path: {abs_path} | exists={exists} | size={size_bytes} bytes | lines={line_count}")
+
         # Step 2: Load local store and retrieve via cosine
         points = load_points_jsonl(LOCAL_STORE_FILE)
+        st.caption(f"Loaded {len(points)} points from local store: {LOCAL_STORE_FILE}")
         # Fetch more than UI needs so reranker (if on) has headroom
         hits = cosine_search(points, qvec, limit=60)
+        # Debug: show top-10 raw cosine results irrespective of threshold
+        if debug_mode:
+            st.markdown("#### Debug: Raw cosine top-10 (pre-rerank)")
+            for h in hits[:10]:
+                payload = h.get("payload") or {}
+                score = float(h.get("score", 0.0))
+                name = payload.get("vendor_name") or (payload.get("data") or {}).get("name") or ""
+                table = payload.get("table", "vendors")
+                st.write(f"- score={score:.4f} | table={table} | name={name}")
 
         # Build unified candidate texts derived from payloads
         candidates = []
@@ -95,27 +121,24 @@ if st.button("Search"):
                 text = f"[{table}] {raw_text}" if raw_text else "[vendors]"
             candidates.append((text, payload, float(h.get("score", 0.0))))
 
-        # Step 3: Scoring — either rerank with CrossEncoder or use cosine scores directly
-        if use_reranker:
-            pairs = [(query, t) for t, _, _ in candidates]
-            scores = reranker.predict(pairs) if pairs else []
-            rescored = sorted(
-                [(t, p, float(s)) for (t, p, _), s in zip(candidates, scores)],
-                key=lambda x: x[2], reverse=True
-            )
-        else:
-            # Cosine-only: trust local cosine scores
-            rescored = sorted(candidates, key=lambda x: x[2], reverse=True)
+        # Step 3: Scoring — cosine-only (no reranker)
+        rescored = sorted(candidates, key=lambda x: x[2], reverse=True)
 
         # Step 4: Apply threshold (CrossEncoder score if ON, else cosine score)
         filtered = [r for r in rescored if r[2] >= min_score]
 
         # Step 5: Render a single column (local store fuel-me)
         st.markdown("### 🔎 Results (fuel-me, local)")
-        if not filtered:
-            st.info("No results above threshold.")
+        to_render = filtered
+        # If nothing passed threshold, fall back to top-10 by score so user sees something
+        if not to_render:
+            st.info("No results above threshold; showing top-10 by score for inspection.")
+            to_render = rescored[:10]
+
+        if not to_render:
+            st.warning("No candidates returned from local cosine search.")
         else:
-            for text, payload, score in filtered[:10]:
+            for text, payload, score in to_render[:10]:
                 st.markdown("---")
                 # Prefer enriched presentation if fields exist; fallback to raw-style
                 name = payload.get('vendor_name') or ''
